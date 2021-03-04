@@ -10,6 +10,7 @@ import time
 import random
 import numpy as np
 
+import itertools
 import functools
 
 import torch
@@ -46,7 +47,10 @@ class EMNISTDataset(data.Dataset):
                blank_label = 11,
                pad_label = 10,
                img_size: [int, int] = (28, 28)):
-      self.dataset = datasets.MNIST(root='./data', train=train, download=True)
+      self.dataset = datasets.EMNIST(root='./data', 
+                                     split='mnist',
+                                     train=train,
+                                     download=True)
       self.max_seq_len = max_seq_len
       self.img_size = img_size
 
@@ -60,6 +64,8 @@ class EMNISTDataset(data.Dataset):
     for i in range(0, seq_len):
       index = random.randint(0, self.dataset.train_data.size(0) - 1)
       image, label = self.dataset[index]
+      image = transforms.functional.rotate(image, angle=-90)
+      image = transforms.functional.hflip(image)
       image = np.array(image) / 255
       insert_pos = np.array([i * image.shape[1], (i + 1) * image.shape[1]])
       
@@ -85,11 +91,11 @@ pad_label = 10
 blank_label = 11
 dataset = EMNISTDataset(train=True, max_seq_len=10, pad_label=pad_label, blank_label=blank_label)
 
-n_images = 40
+n_images = 36
 n_cols = 4
 n_rows = n_images // n_cols + 1
 
-fig = plt.figure(10, figsize=(n_cols * 4, n_rows))
+fig = plt.figure(n_rows, figsize=(n_cols * 4, n_rows))
 
 for num in range(n_images):
   i = num // n_cols
@@ -162,6 +168,9 @@ class RCNN(nn.Module):
                           for i in range(rnn_output.shape[0])])
     return output
 
+cnn_output_height = 6
+cnn_output_width = 69
+
 num_classes = 10 + 1 + 1
 input_size = (28, 28)
 channels_list = [(1, 32), (32, 32), (32, 64), (64, 64)]
@@ -175,147 +184,83 @@ rcnn = RCNN(num_classes,
             rnn_dropout=0.3)
 
 dataloader = data.DataLoader(dataset, batch_size=64, shuffle=True)
-criterion = nn.CTCLoss(blank=blank_label, reduction='mean', zero_infinity=True)
-optimizer = opt.Adam(rcnn.parameters(), lr=1e-4)
+criterion = nn.CTCLoss(blank=blank_label)
+optimizer = opt.Adam(rcnn.parameters(), lr=1e-3)
+
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
 rcnn = rcnn.to(device)
 criterion = criterion.to(device)
 
-epochs = 10
-num_classes = 12
-blank_label = 10
-pad_label = 11
-image_height = 28
-gru_hidden_size = 128
-gru_num_layers = 2
-cnn_output_height = 6
-cnn_output_width = 104
-digits_per_sequence = 15
-number_of_sequences = 10000
-emnist_dataset = datasets.EMNIST('./EMNIST', split="digits", train=True, download=True)
-dataset_sequences = []
-dataset_labels = []
+def train_epoch(model, iterator, optimizer, criterion, device):
+  correct = 0
+  total = 0
+  error = 0
 
-input_size = (28, 28)
-channels_list = [(1, 32), (32, 32), (32, 64), (64, 64)]
+  for batch in iterator:
+      image, labels, labels_lens = batch
+      batch_size = image.shape[0]
+      labels = labels.squeeze()
+      labels_lens = labels_lens.squeeze()
+      
+      optimizer.zero_grad()
+      y_pred = model(image.to(device))
+      y_pred = y_pred.permute(1, 0, 2)
+      
+      output_width = y_pred.shape[0]
+      input_lengths = torch.IntTensor(batch_size).fill_(output_width)
 
-rcnn = RCNN(num_classes,
-            input_size, 
-            channels_list, 
-            cnn_kernel_size=(2, 2), 
-            rnn_hidden=256,
-            rnn_n_layers=4,
-            rnn_dropout=0.3)
+      target_lengths = labels_lens
 
-for i in range(number_of_sequences):
-    random_indices = np.random.randint(len(emnist_dataset.data), size=(digits_per_sequence,))
-    random_digits_images = emnist_dataset.data[random_indices]
-    transformed_random_digits_images = []
+      loss = criterion(y_pred, labels, input_lengths, target_lengths)
+      loss.backward()
+      optimizer.step()
 
-    for img in random_digits_images:
-        img = transforms.ToPILImage()(img)
-        img = TF.rotate(img, -90, fill=0)
-        img = TF.hflip(img)
-        # img = transforms.RandomAffine(degrees=10, translate=(0.2, 0.15), scale=(0.8, 1.1))(img)
-        img = transforms.ToTensor()(img).numpy()
-        transformed_random_digits_images.append(img)
+      error += loss.item()
+      _, max_index = torch.max(y_pred, dim=2)  # max_index.shape == torch.Size([32, 64])
+      
+      for i in range(batch_size):
+          raw_prediction = list(max_index[:, i].detach().cpu().numpy())
+          prediction = torch.IntTensor([c for c, _ in itertools.groupby(raw_prediction) if c not in [pad_label, blank_label]])
+          curr_label = torch.IntTensor([item.item() for item in labels[i] if item.item() != pad_label])
+          if len(prediction) == len(curr_label) and torch.all(prediction.eq(curr_label)):
+              correct += 1
+          total += 1
+  return correct / total, error / len(iterator)
 
-    random_digits_images = np.array(transformed_random_digits_images)
-    random_digits_images[-5:, :, :] = 0
-    random_digits_labels = emnist_dataset.targets[random_indices]
-    random_digits_labels[-5:] = pad_label
-    if i % 2:
-      random_digits_images[-7:-5, :, :] = 0
-      random_digits_labels[-7: -5] = pad_label
-    random_sequence = np.hstack(random_digits_images.reshape((digits_per_sequence, 28, 28)))
-    random_labels = np.hstack(random_digits_labels.reshape(digits_per_sequence, 1))
-    dataset_sequences.append(random_sequence / 255)
-    dataset_labels.append(random_labels)
+for i in range(5):
+  train_accuracy_sequence, error = train_epoch(rcnn, dataloader, optimizer, criterion, device)
+  print(i + 1, 'TRAINING. Correct sequence ratio:', train_accuracy_sequence, 'Mean Error:', error)
 
-dataset_data = torch.Tensor(np.array(dataset_sequences))
-dataset_labels = torch.IntTensor(np.array(dataset_labels))
-
-seq_dataset = data_utils.TensorDataset(dataset_data, dataset_labels)
-train_set, val_set = torch.utils.data.random_split(seq_dataset,
-                                                   [int(len(seq_dataset) * 0.8), int(len(seq_dataset) * 0.2)])
-
-train_loader = torch.utils.data.DataLoader(train_set, batch_size=64, shuffle=True)
-val_loader = torch.utils.data.DataLoader(val_set, batch_size=1, shuffle=True)
-
-
-model = rcnn.to(gpu)
-criterion = nn.CTCLoss(blank=blank_label, reduction='mean', zero_infinity=True)
-optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
-
-# ================================================ TRAINING MODEL ======================================================
-for _ in range(epochs):
-    # ============================================ TRAINING ============================================================
-    train_correct = 0
-    train_total = 0
-    error = 0
-
-    for x_train, y_train in train_loader:
-        batch_size = x_train.shape[0]  # x_train.shape == torch.Size([64, 28, 140])
-        x_train = x_train.view(x_train.shape[0], 1, x_train.shape[1], x_train.shape[2])
-        optimizer.zero_grad()
-        y_pred = model(x_train.cuda())
-        y_pred = y_pred.permute(1, 0, 2)  # y_pred.shape == torch.Size([64, 32, 11])
-        input_lengths = torch.IntTensor(batch_size).fill_(cnn_output_width)
-        target_lengths = torch.IntTensor([sum(t != blank_label) for t in y_train])
-        loss = criterion(y_pred, y_train, input_lengths, target_lengths)
-        loss.backward()
-        optimizer.step()
-
-        error += loss.item()
-        _, max_index = torch.max(y_pred, dim=2)  # max_index.shape == torch.Size([32, 64])
-        for i in range(batch_size):
-            raw_prediction = list(max_index[:, i].detach().cpu().numpy())  # len(raw_prediction) == 32
-            prediction = torch.IntTensor([c for c, _ in groupby(raw_prediction) if c != blank_label])
-            if len(prediction) == len(y_train[i]) and torch.all(prediction.eq(y_train[i])):
-                train_correct += 1
-            train_total += 1
-    print('TRAINING. Correct: ', train_correct, '/', train_total, '=', train_correct / train_total)
-    print(error / len(train_loader))
-
-    # ============================================ VALIDATION ==========================================================
-    val_correct = 0
-    val_total = 0
-    with torch.no_grad():
-      for x_val, y_val in val_loader:
-          batch_size = x_val.shape[0]
-          x_val = x_val.view(x_val.shape[0], 1, x_val.shape[1], x_val.shape[2])
-          y_pred = model(x_val.cuda())
-          y_pred = y_pred.permute(1, 0, 2)
-          input_lengths = torch.IntTensor(batch_size).fill_(cnn_output_width)
-          target_lengths = torch.IntTensor([len(t) for t in y_val])
-          criterion(y_pred, y_val, input_lengths, target_lengths)
-          _, max_index = torch.max(y_pred, dim=2)
-          for i in range(batch_size):
-              raw_prediction = list(max_index[:, i].detach().cpu().numpy())
-              prediction = torch.IntTensor([c for c, _ in groupby(raw_prediction) if c != blank_label])
-              if len(prediction) == len(y_val[i]) and torch.all(prediction.eq(y_val[i])):
-                  val_correct += 1
-              val_total += 1
-      print('TESTING. Correct: ', val_correct, '/', val_total, '=', val_correct / val_total)
-
-# ============================================ TESTING =================================================================
-number_of_test_imgs = 10
-test_loader = torch.utils.data.DataLoader(val_set, batch_size=number_of_test_imgs, shuffle=True)
 test_preds = []
-(x_test, y_test) = next(iter(test_loader))
-y_pred = model(x_test.view(x_test.shape[0], 1, x_test.shape[1], x_test.shape[2]).cuda())
-y_pred = y_pred.permute(1, 0, 2)
-_, max_index = torch.max(y_pred, dim=2)
-for i in range(x_test.shape[0]):
-    raw_prediction = list(max_index[:, i].detach().cpu().numpy())
-    prediction = torch.IntTensor([c for c, _ in groupby(raw_prediction) if c != blank_label])
-    test_preds.append(prediction)
+number_of_test_imgs = 10
 
-for j in range(len(x_test)):
-    mpl.rcParams["font.size"] = 8
-    plt.imshow(x_test[j], cmap='gray')
-    mpl.rcParams["font.size"] = 18
-    plt.gcf().text(x=0.1, y=0.1, s="Actual: " + str(y_test[j].numpy()))
-    plt.gcf().text(x=0.1, y=0.2, s="Predicted: " + str(test_preds[j].numpy()))
-    plt.show()
+dataset_test = EMNISTDataset(train=False, 
+                             max_seq_len=10,
+                             pad_label=pad_label,
+                             blank_label=blank_label)
+
+test_loader = torch.utils.data.DataLoader(dataset_test,
+                                          batch_size=number_of_test_imgs, 
+                                          shuffle=True)
+(test_image, test_labels, test_labels_len) = next(iter(test_loader))
+
+rcnn.eval()
+with torch.no_grad():
+  y_pred = rcnn(test_image.to(device))
+  y_pred = y_pred.permute(1, 0, 2)
+
+_, max_index = torch.max(y_pred, dim=2)
+for i in range(test_image.shape[0]):
+  raw_prediction = list(max_index[:, i].detach().cpu().numpy())
+  prediction = torch.IntTensor([c for c, _ in itertools.groupby(raw_prediction) if c != blank_label])
+  test_preds.append(prediction)
+
+fig = plt.figure(number_of_test_imgs, figsize=(12, number_of_test_imgs * 2))
+
+for j in range(number_of_test_imgs):
+  ax = fig.add_subplot(number_of_test_imgs, 1, j + 1)
+  ax.imshow(test_image[j][0], cmap='gray')
+  ax.set_title("Pred: " + " ".join(list(map(str, test_preds[j].numpy()))))
+  ax.axis('off')
 
