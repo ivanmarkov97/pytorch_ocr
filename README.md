@@ -1,3 +1,3 @@
 # pytorch OCR
 
-pytorch implenemtation simple RCNN network with nn.CTCLoss
+pytorch implementation simple RCNN network with nn.CTCLoss
